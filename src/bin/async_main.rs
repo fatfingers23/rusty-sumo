@@ -10,11 +10,10 @@ use embassy_time::{Duration, Timer};
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
 use esp_backtrace as _;
-use esp_hal::gpio::{AnyPin, GpioPin, Input, Level, Output, Pull};
+use esp_hal::gpio::{GpioPin, Input, Level, Output, Pull};
 use esp_hal::i2c::master::{Config, I2c};
 use esp_hal::mcpwm::operator::PwmPinConfig;
 use esp_hal::mcpwm::timer::PwmWorkingMode;
-use esp_hal::mcpwm::PwmPeripheral;
 use esp_hal::peripherals::{MCPWM0, MCPWM1};
 use esp_hal::{
     mcpwm::{McPwm, PeripheralClockConfig},
@@ -27,13 +26,15 @@ use static_cell::StaticCell;
 use timer::timg::TimerGroup;
 use tinybmp::Bmp;
 
-// type I2c1Bus = Mutex<NoopRawMutex, I2c<Blocking>>;
-
 extern crate alloc;
 
+//Settings
+///If set to true shows some of the more nosier logs
+const DEBUG: bool = true;
+
+//Global variables to share state between tasks
 static RIGHT_TOF: AtomicU16 = AtomicU16::new(0);
 static LEFT_TOF: AtomicU16 = AtomicU16::new(0);
-
 static RUN: AtomicBool = AtomicBool::new(false);
 
 #[main]
@@ -75,8 +76,10 @@ async fn main(spawner: Spawner) {
     let i2c_bus = NoopMutex::new(RefCell::new(i2c));
     let i2c_bus = I2C_BUS.init(i2c_bus);
     // let i2c_bus = CriticalSectionDevice::new(&i2c_ref_cell);
+
+    // Spawn tasks
     spawner.must_spawn(oled_task(i2c_bus));
-    spawner.must_spawn(tof_task(i2c_bus));
+    spawner.must_spawn(tof_task(i2c_bus, peripherals.GPIO32, peripherals.GPIO33));
 
     spawner.must_spawn(motors_task(
         peripherals.GPIO18,
@@ -87,9 +90,6 @@ async fn main(spawner: Spawner) {
         peripherals.MCPWM1,
     ));
 
-    // pin will be high 50% of the
-    // TODO: Spawn some tasks
-    let _ = spawner;
     let start_button = Input::new(peripherals.GPIO35, Pull::Up);
     loop {
         if start_button.is_low() {
@@ -102,19 +102,68 @@ async fn main(spawner: Spawner) {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/v0.22.0/examples/src/bin
 }
 
+/// Embassy task to handle the tof sensors and write the out put to the global variables
+/// uses https://github.com/copterust/vl53l0x
 #[embassy_executor::task]
-async fn tof_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>) {
-    let i2c_device = I2cDevice::new(i2c_bus);
-    let mut tof = vl53l0x::VL53L0x::new(i2c_device).expect("tof");
-    tof.set_measurement_timing_budget(200000)
-        .expect("time budget");
-    tof.start_continuous(0).expect("start");
+async fn tof_task(
+    i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>,
+    right_xshut: GpioPin<32>,
+    left_xshut: GpioPin<33>,
+) {
+    // With rust ownership we have to create two devices from the bus allowing them to be shared
+    let right_i2c_device = I2cDevice::new(i2c_bus);
+    let left_i2c_device = I2cDevice::new(i2c_bus);
+    //Sets both tof xshut pins to low to disable for setup
+    let mut right_xshut = Output::new(right_xshut, Level::Low);
+    let mut left_xshut = Output::new(left_xshut, Level::Low);
+
+    //set right xshut high to enable
+    right_xshut.set_high();
+    //Give some boot up time
+    Timer::after_millis(100).await;
+
+    let mut right_tof = vl53l0x::VL53L0x::new(right_i2c_device).expect("right rof i2c init failed");
+    //Sets a new i2c address for the right tof sensor so we can tell them apart
+    right_tof.set_address(0x52).expect("right: set address");
+    right_tof
+        .set_measurement_timing_budget(200_000)
+        .expect("right: time budget");
+    right_tof.start_continuous(0).expect("right: start");
+
+    //Turns the left on and sets it up with the default address
+    left_xshut.set_high();
+    //Give some boot up time
+    Timer::after_millis(100).await;
+
+    //Sets up the left tof with the default i2c address
+    let mut left_tof = vl53l0x::VL53L0x::new(left_i2c_device).expect("left tof i2c init failed");
+    left_tof
+        .set_measurement_timing_budget(200_000)
+        .expect("left: time budget");
+    left_tof.start_continuous(0).expect("left: start");
+
     loop {
-        let distance = tof
+        let right_distance = right_tof
             .read_range_continuous_millimeters_blocking()
-            .expect("read");
-        RIGHT_TOF.store(distance, core::sync::atomic::Ordering::Relaxed);
-        info!("Distance: {}mm", distance);
+            .expect("right: read");
+        let left_distance = left_tof
+            .read_range_continuous_millimeters_blocking()
+            .expect("left: read");
+
+        //It appears 8,190mm is the max distance. But also seen if it is read its more than likely means the reading failed giving a false positive
+        //So this is a safe bet to stop the rest of the application from working unexpectedly
+        if right_distance != 8_190 {
+            RIGHT_TOF.store(right_distance, core::sync::atomic::Ordering::Relaxed);
+        }
+        if left_distance != 8_190 {
+            LEFT_TOF.store(left_distance, core::sync::atomic::Ordering::Relaxed);
+        }
+        if DEBUG {
+            info!("Right Distance: {}mm", right_distance);
+            info!("Left Distance: {}mm", left_distance);
+        }
+
+        //Can tweak this to get readings faster, but anything under 20ms you need to change set_measurement_timing_budget lower
         Timer::after(Duration::from_millis(100)).await;
     }
 }
