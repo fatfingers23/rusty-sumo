@@ -213,6 +213,17 @@ async fn main(spawner: Spawner) {
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/v0.22.0/examples/src/bin
 }
 
+///Helper function to set the speed of the robot easier
+/// 100 is stop, 0 is full speed
+fn set_speed(speed: u8) {
+    SPEED.store(speed, core::sync::atomic::Ordering::Relaxed);
+}
+
+///Helper function to set the movement of the robot easier
+fn set_movement(movement: Movement) {
+    MOVEMENT.store(movement.to_u8(), core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Embassy task to handle the tof sensors and write the out put to the global variables
 /// uses https://github.com/copterust/vl53l0x
 #[embassy_executor::task]
@@ -323,14 +334,6 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
 
         Timer::after(Duration::from_millis(100)).await;
     }
-}
-
-fn set_speed(speed: u8) {
-    SPEED.store(speed, core::sync::atomic::Ordering::Relaxed);
-}
-
-fn set_movement(movement: Movement) {
-    MOVEMENT.store(movement.to_u8(), core::sync::atomic::Ordering::Relaxed);
 }
 
 #[embassy_executor::task]
