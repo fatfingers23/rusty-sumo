@@ -2,25 +2,31 @@
 #![no_main]
 
 use core::cell::RefCell;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU16};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::NoopMutex;
 use embassy_time::{Duration, Timer};
+use embedded_graphics::mono_font::ascii::FONT_6X10;
+use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
+use embedded_graphics::text::{Baseline, Text};
 use embedded_graphics::{image::Image, pixelcolor::BinaryColor, prelude::*};
 use esp_backtrace as _;
+use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
 use esp_hal::gpio::{GpioPin, Input, Level, Output, Pull};
 use esp_hal::i2c::master::{Config, I2c};
 use esp_hal::mcpwm::operator::PwmPinConfig;
 use esp_hal::mcpwm::timer::PwmWorkingMode;
-use esp_hal::peripherals::{MCPWM0, MCPWM1};
+use esp_hal::peripherals::{ADC1, ADC2, MCPWM0, MCPWM1};
 use esp_hal::{
     mcpwm::{McPwm, PeripheralClockConfig},
     prelude::*,
     timer, Blocking,
 };
 use log::{error, info};
+use mtras_sumo::io::Cursor;
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
 use timer::timg::TimerGroup;
@@ -31,10 +37,15 @@ extern crate alloc;
 //Settings
 ///If set to true shows some of the more nosier logs
 const DEBUG: bool = true;
+const LOTS_OF_LOGS: bool = false;
 
 //Global variables to share state between tasks
 static RIGHT_TOF: AtomicU16 = AtomicU16::new(0);
 static LEFT_TOF: AtomicU16 = AtomicU16::new(0);
+
+static RIGHT_FL: AtomicU16 = AtomicU16::new(0);
+static LEFT_FL: AtomicU16 = AtomicU16::new(0);
+
 static RUN: AtomicBool = AtomicBool::new(false);
 
 #[main]
@@ -88,6 +99,13 @@ async fn main(spawner: Spawner) {
     spawner.must_spawn(oled_task(i2c_bus));
     //Task to read the time of flight sensors
     spawner.must_spawn(tof_task(i2c_bus, peripherals.GPIO32, peripherals.GPIO33));
+    //Task to read the floor sensors
+    spawner.must_spawn(floor_sensors_task(
+        peripherals.GPIO13,
+        peripherals.GPIO34,
+        peripherals.ADC1,
+        peripherals.ADC2,
+    ));
 
     //Task to control the motors
     spawner.must_spawn(motors_task(
@@ -150,29 +168,75 @@ async fn tof_task(
         .set_measurement_timing_budget(200_000)
         .expect("left: time budget");
     left_tof.start_continuous(0).expect("left: start");
-
+    let mut last_right = 0;
+    let mut last_left = 0;
     loop {
-        let right_distance = right_tof
-            .read_range_continuous_millimeters_blocking()
-            .expect("right: read");
-        let left_distance = left_tof
-            .read_range_continuous_millimeters_blocking()
-            .expect("left: read");
+        //We check the result cause I found bumps can cause the reading to fail
+        let right_result = right_tof.read_range_continuous_millimeters_blocking();
+        let left_result = left_tof.read_range_continuous_millimeters_blocking();
 
         //It appears 8,190mm is the max distance. But also seen if it is read its more than likely means the reading failed giving a false positive
-        //So this is a safe bet to stop the rest of the application from working unexpectedly
-        if right_distance != 8_190 {
-            RIGHT_TOF.store(right_distance, core::sync::atomic::Ordering::Relaxed);
-        }
-        if left_distance != 8_190 {
-            LEFT_TOF.store(left_distance, core::sync::atomic::Ordering::Relaxed);
-        }
-        if DEBUG {
-            info!("Right Distance: {}mm", right_distance);
-            info!("Left Distance: {}mm", left_distance);
+        //We also check the last reading to see if it's the same as the current reading if so its likely max distance
+        static MAX_DISTANCE: u16 = 8_190;
+        if let Ok(right_distance) = right_result {
+            if LOTS_OF_LOGS {
+                info!("Right TOF: {}", right_distance);
+            }
+            //Safe to say if the reading is max twice it's real max distance
+            if right_distance != MAX_DISTANCE || last_right != MAX_DISTANCE {
+                last_right = right_distance;
+                RIGHT_TOF.store(right_distance, core::sync::atomic::Ordering::Relaxed);
+            }
         }
 
-        //Can tweak this to get readings faster, but anything under 20ms you need to change set_measurement_timing_budget lower
+        if let Ok(left_distance) = left_result {
+            if LOTS_OF_LOGS {
+                info!("Left TOF: {}", left_distance);
+            }
+            //Safe to say if the reading is max twice it's real max distance
+            if left_distance != MAX_DISTANCE || last_left != MAX_DISTANCE {
+                last_left = left_distance;
+                LEFT_TOF.store(left_distance, core::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        //Can tweak this to get readings faster you may need to change set_measurement_timing_budget lower
+        Timer::after(Duration::from_millis(100)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, adc2: ADC2) {
+    let mut adc1_config = AdcConfig::new();
+    let mut right_pin = adc1_config.enable_pin(right, Attenuation::Attenuation0dB);
+    let mut right_adc = Adc::new(adc1, adc1_config);
+
+    let mut adc2_config = AdcConfig::new();
+    let mut left_pin = adc2_config.enable_pin(left, Attenuation::Attenuation0dB);
+    let mut left_adc = Adc::new(adc2, adc2_config);
+
+    loop {
+        let left_result = nb::block!(left_adc.read_oneshot(&mut left_pin));
+        let right_result = nb::block!(right_adc.read_oneshot(&mut right_pin));
+        match left_result {
+            Ok(left_reading) => {
+                LEFT_FL.store(left_reading, core::sync::atomic::Ordering::Relaxed);
+                if LOTS_OF_LOGS {
+                    info!("Left Reading: {}", left_reading);
+                }
+            }
+            Err(e) => error!("Error reading left floor sensor: {:?}", e),
+        }
+        match right_result {
+            Ok(right_reading) => {
+                RIGHT_FL.store(right_reading, core::sync::atomic::Ordering::Relaxed);
+                if LOTS_OF_LOGS {
+                    info!("Right Reading: {}", right_reading);
+                }
+            }
+            Err(e) => error!("Error reading right floor sensor: {:?}", e),
+        }
+
         Timer::after(Duration::from_millis(100)).await;
     }
 }
@@ -261,49 +325,93 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
     //sets up a i2c device from the bus
     let i2c_device = I2cDevice::new(i2c_bus);
     let interface = I2CDisplayInterface::new(i2c_device);
-    let mut display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate0)
-        .into_buffered_graphics_mode();
+
+    let rotation = match DEBUG {
+        true => DisplayRotation::Rotate180,
+        false => DisplayRotation::Rotate0,
+    };
+
+    let mut display =
+        Ssd1306::new(interface, DisplaySize128x32, rotation).into_buffered_graphics_mode();
     let result = display.init();
     match result {
         Ok(_) => info!("Display initialized"),
         Err(e) => error!("Error initializing display: {:?}", e),
     }
 
-    // DVD example from https://github.com/rust-embedded-community/ssd1306/blob/master/examples/rtic_dvd.rs
-    let bmp: Bmp<BinaryColor> = Bmp::from_slice(include_bytes!("../.././assets/dvd.bmp")).unwrap();
+    //Just used for the dvb example
     let mut top_left = Point::zero();
     let mut velocity = Point::new(1, 1);
+    // DVD example from https://github.com/rust-embedded-community/ssd1306/blob/master/examples/rtic_dvd.rs
+    let bmp: Bmp<BinaryColor> = Bmp::from_slice(include_bytes!("../.././assets/dvd.bmp")).unwrap();
+
+    let text_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
+    let mut top_write_buffer = [0u8; 512];
+    let mut top_line_cursor = Cursor::new(&mut top_write_buffer);
+    let mut bottom_write_buffer = [0u8; 512];
+    let mut bottom_line_cursor = Cursor::new(&mut bottom_write_buffer);
 
     loop {
-        let bottom_right = top_left + bmp.bounding_box().size;
+        //If debug is enable show sensor data on the display
+        if DEBUG {
+            let _ = display.clear(BinaryColor::Off);
+            let right_tof = RIGHT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+            let left_tof = LEFT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+            write!(top_line_cursor, "TOF: {}    TOF: {}", left_tof, right_tof).unwrap();
+            let _ = Text::with_baseline(
+                top_line_cursor.as_str(),
+                Point::zero(),
+                text_style,
+                Baseline::Top,
+            )
+            .draw(&mut display);
 
-        // Erase previous image position with a filled black rectangle
-        Rectangle::with_corners(top_left, bottom_right)
-            .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
-            .draw(&mut display)
-            .unwrap();
+            let right_fl = RIGHT_FL.load(core::sync::atomic::Ordering::Relaxed);
+            let left_fl = LEFT_FL.load(core::sync::atomic::Ordering::Relaxed);
+            write!(bottom_line_cursor, "L_FL: {} R_FL: {}", left_fl, right_fl).unwrap();
+            let _ = Text::with_baseline(
+                bottom_line_cursor.as_str(),
+                Point::new(0, 10),
+                text_style,
+                Baseline::Top,
+            )
+            .draw(&mut display);
+            bottom_line_cursor.clear();
+            top_line_cursor.clear();
+        } else {
+            let bottom_right = top_left + bmp.bounding_box().size;
 
-        // Check if the image collided with a screen edge
-        {
-            if bottom_right.x > display.size().width as i32 || top_left.x < 0 {
-                velocity.x = -velocity.x;
+            // Erase previous image position with a filled black rectangle
+            Rectangle::with_corners(top_left, bottom_right)
+                .into_styled(PrimitiveStyle::with_fill(BinaryColor::Off))
+                .draw(&mut display)
+                .unwrap();
+
+            // Check if the image collided with a screen edge
+            {
+                if bottom_right.x > display.size().width as i32 || top_left.x < 0 {
+                    velocity.x = -velocity.x;
+                }
+
+                if bottom_right.y > display.size().height as i32 || top_left.y < 0 {
+                    velocity.y = -velocity.y;
+                }
             }
 
-            if bottom_right.y > display.size().height as i32 || top_left.y < 0 {
-                velocity.y = -velocity.y;
-            }
+            // Move the image
+            top_left += velocity;
+
+            // Draw image at new position
+            Image::new(&bmp, top_left)
+                .draw(&mut display.color_converted())
+                .unwrap();
         }
-
-        // Move the image
-        top_left += velocity;
-
-        // Draw image at new position
-        Image::new(&bmp, top_left)
-            .draw(&mut display.color_converted())
-            .unwrap();
-
-        // Write changes to the display
-        display.flush().unwrap();
+        // // Write changes to the display
+        let _ = display.flush();
 
         Timer::after(Duration::from_millis(50)).await;
     }
