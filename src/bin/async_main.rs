@@ -3,7 +3,7 @@
 
 use core::cell::RefCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU16};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU8};
 use embassy_embedded_hal::shared_bus::blocking::i2c::I2cDevice;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::NoopMutex;
@@ -40,13 +40,57 @@ const DEBUG: bool = true;
 const LOTS_OF_LOGS: bool = false;
 
 //Global variables to share state between tasks
+
+//Holds the time of flight sensor readings in mm
 static RIGHT_TOF: AtomicU16 = AtomicU16::new(0);
 static LEFT_TOF: AtomicU16 = AtomicU16::new(0);
 
-static RIGHT_FL: AtomicU16 = AtomicU16::new(0);
-static LEFT_FL: AtomicU16 = AtomicU16::new(0);
+//Holds the floor sensor readings
+//HACK these seem off for me. Left is always max, right is always 0 and only somewhat react to the floor change
+static RIGHT_FLOOR: AtomicU16 = AtomicU16::new(0);
+static LEFT_FLOOR: AtomicU16 = AtomicU16::new(0);
 
+//Should the robot run or not
 static RUN: AtomicBool = AtomicBool::new(false);
+
+//Movement commands
+//Store as numbers to make it a bit easier on static typing
+static MOVEMENT: AtomicU8 = AtomicU8::new(0);
+
+//Speed of the robot
+//100 is stop, 0 is full speed
+static SPEED: AtomicU8 = AtomicU8::new(100);
+
+pub enum Movement {
+    Stop = 0,
+    Forward = 1,
+    Backward = 2,
+    Left = 3,
+    Right = 4,
+}
+
+impl Movement {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Movement::Stop,
+            1 => Movement::Forward,
+            2 => Movement::Backward,
+            3 => Movement::Left,
+            4 => Movement::Right,
+            _ => Movement::Stop,
+        }
+    }
+
+    pub fn to_u8(&self) -> u8 {
+        match self {
+            Movement::Stop => 0,
+            Movement::Forward => 1,
+            Movement::Backward => 2,
+            Movement::Left => 3,
+            Movement::Right => 4,
+        }
+    }
+}
 
 #[main]
 async fn main(spawner: Spawner) {
@@ -118,11 +162,51 @@ async fn main(spawner: Spawner) {
     ));
 
     let start_button = Input::new(peripherals.GPIO35, Pull::Up);
+    let mut bot_running = false;
     loop {
         if start_button.is_low() {
-            Timer::after_secs(3).await;
-            info!("Button pressed. Starting robot");
-            RUN.store(true, core::sync::atomic::Ordering::Relaxed);
+            if !bot_running {
+                Timer::after_secs(3).await;
+            }
+            bot_running = !bot_running;
+            match bot_running {
+                true => info!("Robot starting.."),
+                false => info!("Robot stopping.."),
+            }
+            RUN.store(bot_running, core::sync::atomic::Ordering::Relaxed);
+        }
+        if bot_running {
+            info!("Robot is running: Doing the thing");
+            //Forward
+            set_movement(Movement::Forward);
+            set_speed(15);
+            Timer::after(Duration::from_millis(500)).await;
+
+            //Turn right
+            set_speed(10);
+            set_movement(Movement::Right);
+            Timer::after(Duration::from_secs(4)).await;
+
+            //Forward
+            set_movement(Movement::Forward);
+            set_speed(15);
+            Timer::after(Duration::from_millis(500)).await;
+
+            //Turn left
+            set_speed(10);
+            set_movement(Movement::Left);
+            Timer::after(Duration::from_secs(4)).await;
+
+            //forward
+            set_speed(15);
+            set_movement(Movement::Forward);
+            Timer::after(Duration::from_millis(500)).await;
+
+            //stop
+            set_movement(Movement::Stop);
+            Timer::after(Duration::from_secs(2)).await;
+            set_movement(Movement::Backward);
+            Timer::after(Duration::from_millis(500)).await;
         }
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -220,7 +304,7 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
         let right_result = nb::block!(right_adc.read_oneshot(&mut right_pin));
         match left_result {
             Ok(left_reading) => {
-                LEFT_FL.store(left_reading, core::sync::atomic::Ordering::Relaxed);
+                LEFT_FLOOR.store(left_reading, core::sync::atomic::Ordering::Relaxed);
                 if LOTS_OF_LOGS {
                     info!("Left Reading: {}", left_reading);
                 }
@@ -229,7 +313,7 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
         }
         match right_result {
             Ok(right_reading) => {
-                RIGHT_FL.store(right_reading, core::sync::atomic::Ordering::Relaxed);
+                RIGHT_FLOOR.store(right_reading, core::sync::atomic::Ordering::Relaxed);
                 if LOTS_OF_LOGS {
                     info!("Right Reading: {}", right_reading);
                 }
@@ -239,6 +323,14 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
 
         Timer::after(Duration::from_millis(100)).await;
     }
+}
+
+fn set_speed(speed: u8) {
+    SPEED.store(speed, core::sync::atomic::Ordering::Relaxed);
+}
+
+fn set_movement(movement: Movement) {
+    MOVEMENT.store(movement.to_u8(), core::sync::atomic::Ordering::Relaxed);
 }
 
 #[embassy_executor::task]
@@ -259,15 +351,12 @@ async fn motors_task(
     let clock_cfg = PeripheralClockConfig::with_frequency(32.MHz()).unwrap();
     let mut right_mcpwm = McPwm::new(right_mc, clock_cfg);
 
-    // connect operator0 to timer0
     right_mcpwm.operator0.set_timer(&right_mcpwm.timer0);
-    // connect operator0 to pin
+
     let mut right_motor = right_mcpwm
         .operator0
         .with_pin_a(right_a, PwmPinConfig::UP_ACTIVE_HIGH);
 
-    // start timer with timestamp values in the range of 0..=99 and a frequency of
-    // 20 kHz
     let timer_clock_cfg = clock_cfg
         .timer_clock_with_frequency(99, PwmWorkingMode::Increase, 5.kHz())
         .unwrap();
@@ -277,9 +366,7 @@ async fn motors_task(
     let clock_cfg = PeripheralClockConfig::with_frequency(32.MHz()).unwrap();
     let mut left_mcpwm = McPwm::new(left_mc, clock_cfg);
 
-    // connect operator0 to timer0
     left_mcpwm.operator0.set_timer(&left_mcpwm.timer0);
-    // connect operator0 to pin
     let mut left_motor = left_mcpwm
         .operator0
         .with_pin_a(left_a, PwmPinConfig::UP_ACTIVE_HIGH);
@@ -292,25 +379,68 @@ async fn motors_task(
     let mut right_direction = Output::new(right_b, Level::High);
     let mut left_direction = Output::new(left_b, Level::High);
 
-    right_motor.set_timestamp(90);
-    left_motor.set_timestamp(90);
-
     loop {
-        let right_distance = RIGHT_TOF.load(core::sync::atomic::Ordering::Relaxed);
-        // let left_distance = LEFT_TOF.load(core::sync::atomic::Ordering::Relaxed);
-        if right_distance > 500 {
-            right_motor.set_timestamp(25);
-            left_motor.set_timestamp(25);
-        } else if right_distance > 300 {
-            right_motor.set_timestamp(30);
-            left_motor.set_timestamp(30);
-        } else if right_distance > 100 {
-            right_motor.set_timestamp(90);
-            left_motor.set_timestamp(90);
-        } else if right_distance > 30 {
-            right_motor.set_timestamp(100);
-            left_motor.set_timestamp(100);
+        let current_movement = match RUN.load(core::sync::atomic::Ordering::Relaxed) {
+            true => Movement::from_u8(MOVEMENT.load(core::sync::atomic::Ordering::Relaxed)),
+            false => Movement::Stop,
+        };
+        let speed = SPEED.load(core::sync::atomic::Ordering::Relaxed) as u16;
+        Movement::from_u8(MOVEMENT.load(core::sync::atomic::Ordering::Relaxed));
+        match current_movement {
+            Movement::Stop => {
+                right_motor.set_timestamp(100);
+                left_motor.set_timestamp(100);
+            }
+            Movement::Forward => {
+                right_direction.set_high();
+                left_direction.set_high();
+                right_motor.set_timestamp(speed);
+                left_motor.set_timestamp(speed);
+            }
+            Movement::Backward => {
+                right_direction.set_low();
+                left_direction.set_low();
+                right_motor.set_timestamp(speed);
+                left_motor.set_timestamp(speed);
+            }
+            Movement::Left => {
+                right_direction.set_high();
+                left_direction.set_low();
+                right_motor.set_timestamp(speed);
+                left_motor.set_timestamp(speed);
+            }
+            Movement::Right => {
+                right_direction.set_low();
+                left_direction.set_high();
+                right_motor.set_timestamp(speed);
+                left_motor.set_timestamp(speed);
+            }
         }
+
+        //If toggled off stop the motors
+        // if !RUN.load(core::sync::atomic::Ordering::Relaxed) {
+        //     //TODO not work just make it follow the order
+        //     right_motor.set_timestamp(0);
+        //     left_motor.set_timestamp(0);
+        //     Timer::after(Duration::from_millis(100)).await;
+        //     continue;
+        // }
+
+        // let right_distance = RIGHT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+        // // let left_distance = LEFT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+        // if right_distance > 500 {
+        //     right_motor.set_timestamp(25);
+        //     left_motor.set_timestamp(25);
+        // } else if right_distance > 300 {
+        //     right_motor.set_timestamp(30);
+        //     left_motor.set_timestamp(30);
+        // } else if right_distance > 100 {
+        //     right_motor.set_timestamp(90);
+        //     left_motor.set_timestamp(90);
+        // } else if right_distance > 30 {
+        //     right_motor.set_timestamp(100);
+        //     left_motor.set_timestamp(100);
+        // }
         Timer::after(Duration::from_millis(100)).await;
     }
 }
@@ -370,8 +500,8 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
             )
             .draw(&mut display);
 
-            let right_fl = RIGHT_FL.load(core::sync::atomic::Ordering::Relaxed);
-            let left_fl = LEFT_FL.load(core::sync::atomic::Ordering::Relaxed);
+            let right_fl = RIGHT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
+            let left_fl = LEFT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
             write!(bottom_line_cursor, "L_FL: {} R_FL: {}", left_fl, right_fl).unwrap();
             let _ = Text::with_baseline(
                 bottom_line_cursor.as_str(),
