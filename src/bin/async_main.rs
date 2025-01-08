@@ -20,7 +20,7 @@ use esp_hal::{
     prelude::*,
     timer, Blocking,
 };
-use log::info;
+use log::{error, info};
 use ssd1306::{prelude::*, I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
 use timer::timg::TimerGroup;
@@ -39,6 +39,10 @@ static RUN: AtomicBool = AtomicBool::new(false);
 
 #[main]
 async fn main(spawner: Spawner) {
+    // This is all setup stuff for embassy and the esp32
+
+    // peripherals is how you access pins and other peripherals on the ESP32
+    // Example Input::new(peripherals.GPIO35, Pull::Up); sets gpio35 as an input with pull up for the on board button
     let peripherals = esp_hal::init({
         let mut config = esp_hal::Config::default();
         config.cpu_clock = CpuClock::max();
@@ -52,8 +56,6 @@ async fn main(spawner: Spawner) {
     let timer0 = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init(timer0.timer0);
 
-    info!("Embassy initialized!");
-
     let timer1 = TimerGroup::new(peripherals.TIMG0);
     let _init = esp_wifi::init(
         timer1.timer0,
@@ -62,25 +64,32 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    //lcd setup
-    // spawner.must_spawn(oled_task(peripherals.I2C0, peripherals.GPIO22, peripherals.GPIO21));
+    info!("Embassy initialized!");
+
+    //Sets up the i2c and creates a bus
+    //The bus lets us share the i2c between tasks since Rust has different ownership rules
     let i2c = peripherals.I2C0;
     let mut config = Config::default();
     config.frequency = 400.kHz().into();
     let i2c = I2c::new(i2c, config)
         .with_scl(peripherals.GPIO22)
         .with_sda(peripherals.GPIO21);
-    // let i2c_ref_cell = critical_section::Mutex::new(RefCell::new(i2c));
 
     static I2C_BUS: StaticCell<NoopMutex<RefCell<I2c<Blocking>>>> = StaticCell::new();
     let i2c_bus = NoopMutex::new(RefCell::new(i2c));
     let i2c_bus = I2C_BUS.init(i2c_bus);
-    // let i2c_bus = CriticalSectionDevice::new(&i2c_ref_cell);
 
-    // Spawn tasks
+    // Spawn tasks. This is where the bulk of the application logic goes. These each run independently and asynchronous.
+    // So instead of having one main loop/while there can be several with them sharing data between each
+
+    //Quick comment above each task spawner. Can read comments in each method to see more details
+
+    //Task to run the display
     spawner.must_spawn(oled_task(i2c_bus));
+    //Task to read the time of flight sensors
     spawner.must_spawn(tof_task(i2c_bus, peripherals.GPIO32, peripherals.GPIO33));
 
+    //Task to control the motors
     spawner.must_spawn(motors_task(
         peripherals.GPIO18,
         peripherals.GPIO19,
@@ -94,7 +103,7 @@ async fn main(spawner: Spawner) {
     loop {
         if start_button.is_low() {
             Timer::after_secs(3).await;
-            info!("Button pressed");
+            info!("Button pressed. Starting robot");
             RUN.store(true, core::sync::atomic::Ordering::Relaxed);
         }
         Timer::after(Duration::from_millis(100)).await;
@@ -242,19 +251,25 @@ async fn motors_task(
     }
 }
 
+/// Task to run the oled display using embedded graphics
+/// Any of these examples will work, but keep in mind the display is 128x32
+/// https://github.com/embedded-graphics/examples/tree/main/eg-0.8
+/// More examples from the display crate
+/// https://github.com/rust-embedded-community/ssd1306/tree/master/examples
 #[embassy_executor::task]
 async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>) {
+    //sets up a i2c device from the bus
     let i2c_device = I2cDevice::new(i2c_bus);
     let interface = I2CDisplayInterface::new(i2c_device);
     let mut display = Ssd1306::new(interface, DisplaySize128x32, DisplayRotation::Rotate0)
         .into_buffered_graphics_mode();
-    // display.init();
     let result = display.init();
     match result {
         Ok(_) => info!("Display initialized"),
-        Err(e) => info!("Error initializing display: {:?}", e),
+        Err(e) => error!("Error initializing display: {:?}", e),
     }
 
+    // DVD example from https://github.com/rust-embedded-community/ssd1306/blob/master/examples/rtic_dvd.rs
     let bmp: Bmp<BinaryColor> = Bmp::from_slice(include_bytes!("../.././assets/dvd.bmp")).unwrap();
     let mut top_left = Point::zero();
     let mut velocity = Point::new(1, 1);
