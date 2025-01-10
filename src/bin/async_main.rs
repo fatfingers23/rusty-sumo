@@ -46,7 +46,7 @@ static RIGHT_TOF: AtomicU16 = AtomicU16::new(0);
 static LEFT_TOF: AtomicU16 = AtomicU16::new(0);
 
 //Holds the floor sensor readings
-//HACK these seem off for me. Left is always max, right is always 0 and only somewhat react to the floor change
+//HACK the floor sensors seem off for me. Left is always max, right is always 0 and only somewhat react to the floor change
 static RIGHT_FLOOR: AtomicU16 = AtomicU16::new(0);
 static LEFT_FLOOR: AtomicU16 = AtomicU16::new(0);
 
@@ -58,15 +58,15 @@ static RUN: AtomicBool = AtomicBool::new(false);
 static MOVEMENT: AtomicU8 = AtomicU8::new(0);
 
 //Speed of the robot
-//100 is stop, 0 is full speed
+//1-100 higher is faster. Lower may not spin the wheels at all
 static SPEED: AtomicU8 = AtomicU8::new(100);
 
 pub enum Movement {
     Stop = 0,
     Forward = 1,
     Backward = 2,
-    Left = 3,
-    Right = 4,
+    SpinLeft = 3,
+    SpinRight = 4,
 }
 
 impl Movement {
@@ -75,8 +75,8 @@ impl Movement {
             0 => Movement::Stop,
             1 => Movement::Forward,
             2 => Movement::Backward,
-            3 => Movement::Left,
-            4 => Movement::Right,
+            3 => Movement::SpinLeft,
+            4 => Movement::SpinRight,
             _ => Movement::Stop,
         }
     }
@@ -86,8 +86,8 @@ impl Movement {
             Movement::Stop => 0,
             Movement::Forward => 1,
             Movement::Backward => 2,
-            Movement::Left => 3,
-            Movement::Right => 4,
+            Movement::SpinLeft => 3,
+            Movement::SpinRight => 4,
         }
     }
 }
@@ -163,9 +163,11 @@ async fn main(spawner: Spawner) {
 
     let start_button = Input::new(peripherals.GPIO35, Pull::Up);
     let mut bot_running = false;
+
     loop {
         if start_button.is_low() {
             if !bot_running {
+                info!("Robot starting in 3 seconds..");
                 Timer::after_secs(3).await;
             }
             bot_running = !bot_running;
@@ -174,47 +176,45 @@ async fn main(spawner: Spawner) {
                 false => info!("Robot stopping.."),
             }
             RUN.store(bot_running, core::sync::atomic::Ordering::Relaxed);
-        }
-        if bot_running {
-            info!("Robot is running: Doing the thing");
-            //Forward
-            set_movement(Movement::Forward);
-            set_speed(15);
-            Timer::after(Duration::from_millis(500)).await;
-
-            //Turn right
-            set_speed(10);
-            set_movement(Movement::Right);
-            Timer::after(Duration::from_secs(4)).await;
-
-            //Forward
-            set_movement(Movement::Forward);
-            set_speed(15);
-            Timer::after(Duration::from_millis(500)).await;
-
-            //Turn left
-            set_speed(10);
-            set_movement(Movement::Left);
-            Timer::after(Duration::from_secs(4)).await;
-
-            //forward
-            set_speed(15);
-            set_movement(Movement::Forward);
-            Timer::after(Duration::from_millis(500)).await;
-
-            //stop
-            set_movement(Movement::Stop);
-            Timer::after(Duration::from_secs(2)).await;
-            set_movement(Movement::Backward);
-            Timer::after(Duration::from_millis(500)).await;
+            if bot_running {
+                //Spawns the main robot loop.
+                spawner.must_spawn(main_robot_loop());
+            }
         }
         Timer::after(Duration::from_millis(100)).await;
     }
     // for inspiration have a look at the examples at https://github.com/esp-rs/esp-hal/tree/v0.22.0/examples/src/bin
 }
 
+///This is where you write the actual logic for your robot. Does it follow a line? Avoid obstacles? etc
+#[embassy_executor::task]
+async fn main_robot_loop(){
+    set_speed(25);
+    set_movement(Movement::Forward);
+    Timer::after_millis(1000).await;
+
+    set_movement(Movement::SpinRight);
+    Timer::after_millis(500).await;
+
+    set_movement(Movement::Forward);
+    Timer::after_millis(1000).await;
+
+    set_movement(Movement::SpinLeft);
+    Timer::after_millis(500).await;
+
+    set_movement(Movement::Forward);
+    Timer::after_millis(1000).await;
+
+    set_movement(Movement::Backward);
+    Timer::after_millis(1000).await;
+
+    set_movement(Movement::Stop);
+
+    RUN.store(false, core::sync::atomic::Ordering::Relaxed);
+}
+
 ///Helper function to set the speed of the robot easier
-/// 100 is stop, 0 is full speed
+///1-100 higher is faster. Lower may not spin the wheels at all
 fn set_speed(speed: u8) {
     SPEED.store(speed, core::sync::atomic::Ordering::Relaxed);
 }
@@ -336,6 +336,8 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
     }
 }
 
+
+///Sets up the motors and controls them based on the global variables
 #[embassy_executor::task]
 async fn motors_task(
     left_a: GpioPin<18>,
@@ -350,101 +352,95 @@ async fn motors_task(
         Timer::after(Duration::from_millis(100)).await;
     }
 
-    //Right motor
+    //They can all share the same config
     let clock_cfg = PeripheralClockConfig::with_frequency(32.MHz()).unwrap();
-    let mut right_mcpwm = McPwm::new(right_mc, clock_cfg);
+    let timer_clock_cfg = clock_cfg
+        .timer_clock_with_frequency(99, PwmWorkingMode::Increase, 5.kHz())
+        .unwrap();
 
+    //Right motor
+    let mut right_mcpwm = McPwm::new(right_mc, clock_cfg);
     right_mcpwm.operator0.set_timer(&right_mcpwm.timer0);
 
-    let mut right_motor = right_mcpwm
+    let mut right_motor_a = right_mcpwm
         .operator0
         .with_pin_a(right_a, PwmPinConfig::UP_ACTIVE_HIGH);
+    let mut right_motor_b = right_mcpwm
+        .operator1
+        .with_pin_b(right_b, PwmPinConfig::UP_ACTIVE_HIGH);
 
-    let timer_clock_cfg = clock_cfg
-        .timer_clock_with_frequency(99, PwmWorkingMode::Increase, 5.kHz())
-        .unwrap();
-    right_mcpwm.timer0.start(timer_clock_cfg);
+    right_mcpwm.timer0.start(timer_clock_cfg.clone());
+    right_mcpwm.timer1.start(timer_clock_cfg.clone());
 
     //Left motor
-    let clock_cfg = PeripheralClockConfig::with_frequency(32.MHz()).unwrap();
-    let mut left_mcpwm = McPwm::new(left_mc, clock_cfg);
 
+    let mut left_mcpwm = McPwm::new(left_mc, clock_cfg);
     left_mcpwm.operator0.set_timer(&left_mcpwm.timer0);
-    let mut left_motor = left_mcpwm
+
+    let mut left_motor_a = left_mcpwm
         .operator0
         .with_pin_a(left_a, PwmPinConfig::UP_ACTIVE_HIGH);
-    let timer_clock_cfg = clock_cfg
-        .timer_clock_with_frequency(99, PwmWorkingMode::Increase, 5.kHz())
-        .unwrap();
-    left_mcpwm.timer0.start(timer_clock_cfg);
+    let mut left_motor_b = left_mcpwm
+        .operator1
+        .with_pin_b(left_b, PwmPinConfig::UP_ACTIVE_HIGH);
 
-    //High or low reverses it it seems?
-    let mut right_direction = Output::new(right_b, Level::High);
-    let mut left_direction = Output::new(left_b, Level::High);
+    left_mcpwm.timer0.start(timer_clock_cfg.clone());
+    left_mcpwm.timer1.start(timer_clock_cfg);
 
     loop {
+        //check to see if the robot should run
         let current_movement = match RUN.load(core::sync::atomic::Ordering::Relaxed) {
             true => Movement::from_u8(MOVEMENT.load(core::sync::atomic::Ordering::Relaxed)),
             false => Movement::Stop,
         };
         let speed = SPEED.load(core::sync::atomic::Ordering::Relaxed) as u16;
         Movement::from_u8(MOVEMENT.load(core::sync::atomic::Ordering::Relaxed));
+
+        //Each pin(a,b) are pwm pins. One is set to low pwm and other to selected speed. Then switch
+        //to change direction
+
         match current_movement {
             Movement::Stop => {
-                right_motor.set_timestamp(100);
-                left_motor.set_timestamp(100);
+                left_motor_a.set_timestamp(0);
+                left_motor_b.set_timestamp(0);
+                right_motor_a.set_timestamp(0);
+                right_motor_b.set_timestamp(0);
             }
             Movement::Forward => {
-                right_direction.set_high();
-                left_direction.set_high();
-                right_motor.set_timestamp(speed);
-                left_motor.set_timestamp(speed);
+                //Motor spins clockwise
+                right_motor_a.set_timestamp(0);
+                right_motor_b.set_timestamp(speed);
+                //Motor spins clockwise
+                left_motor_a.set_timestamp(0);
+                left_motor_b.set_timestamp(speed);
             }
             Movement::Backward => {
-                right_direction.set_low();
-                left_direction.set_low();
-                right_motor.set_timestamp(speed);
-                left_motor.set_timestamp(speed);
+                //Motor spins counter clockwise
+                right_motor_a.set_timestamp(speed);
+                right_motor_b.set_timestamp(0);
+                //Motor spins counter clockwise
+                left_motor_a.set_timestamp(speed);
+                left_motor_b.set_timestamp(0);
+
             }
-            Movement::Left => {
-                right_direction.set_high();
-                left_direction.set_low();
-                right_motor.set_timestamp(speed);
-                left_motor.set_timestamp(speed);
+            Movement::SpinLeft => {
+                //Motor spins  clockwise
+                right_motor_a.set_timestamp(0);
+                right_motor_b.set_timestamp(speed);
+                //Motor spins counter clockwise
+                left_motor_a.set_timestamp(speed);
+                left_motor_b.set_timestamp(0);
             }
-            Movement::Right => {
-                right_direction.set_low();
-                left_direction.set_high();
-                right_motor.set_timestamp(speed);
-                left_motor.set_timestamp(speed);
+            Movement::SpinRight => {
+                //Motor spins counter clockwise
+                right_motor_a.set_timestamp(speed);
+                right_motor_b.set_timestamp(0);
+                //Motor spins clockwise
+                left_motor_a.set_timestamp(0);
+                left_motor_b.set_timestamp(speed);
             }
         }
-
-        //If toggled off stop the motors
-        // if !RUN.load(core::sync::atomic::Ordering::Relaxed) {
-        //     //TODO not work just make it follow the order
-        //     right_motor.set_timestamp(0);
-        //     left_motor.set_timestamp(0);
-        //     Timer::after(Duration::from_millis(100)).await;
-        //     continue;
-        // }
-
-        // let right_distance = RIGHT_TOF.load(core::sync::atomic::Ordering::Relaxed);
-        // // let left_distance = LEFT_TOF.load(core::sync::atomic::Ordering::Relaxed);
-        // if right_distance > 500 {
-        //     right_motor.set_timestamp(25);
-        //     left_motor.set_timestamp(25);
-        // } else if right_distance > 300 {
-        //     right_motor.set_timestamp(30);
-        //     left_motor.set_timestamp(30);
-        // } else if right_distance > 100 {
-        //     right_motor.set_timestamp(90);
-        //     left_motor.set_timestamp(90);
-        // } else if right_distance > 30 {
-        //     right_motor.set_timestamp(100);
-        //     left_motor.set_timestamp(100);
-        // }
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
@@ -543,7 +539,7 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
                 .draw(&mut display.color_converted())
                 .unwrap();
         }
-        // // Write changes to the display
+         // Write changes to the display
         let _ = display.flush();
 
         Timer::after(Duration::from_millis(50)).await;
