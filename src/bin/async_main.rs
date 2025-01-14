@@ -525,7 +525,7 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
             )
             .draw(&mut display);
 
-            let right_fl = RIGHT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
+            let _right_fl = RIGHT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
             let left_fl = LEFT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
             // write!(bottom_line_cursor, "L_FL: {} R_FL: {}", left_fl, right_fl).unwrap();
             let running = RUN.load(core::sync::atomic::Ordering::Relaxed);
