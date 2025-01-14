@@ -187,30 +187,58 @@ async fn main(spawner: Spawner) {
 }
 
 ///This is where you write the actual logic for your robot. Does it follow a line? Avoid obstacles? etc
-#[embassy_executor::task]
-async fn main_robot_loop(){
-    set_speed(25);
-    set_movement(Movement::Forward);
-    Timer::after_millis(1000).await;
+#[embassy_executor::task(pool_size = 1)]
+async fn main_robot_loop() {
+    let mut right_speed_up = 30;
+    let mut left_speed_up = 30;
+    loop {
+        let left_tof = LEFT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+        let right_tof = RIGHT_TOF.load(core::sync::atomic::Ordering::Relaxed);
+        let current_movement =
+            Movement::from_u8(MOVEMENT.load(core::sync::atomic::Ordering::Relaxed));
 
-    set_movement(Movement::SpinRight);
-    Timer::after_millis(500).await;
+        if left_tof < 45 || right_tof < 45 {
+            if current_movement.to_u8() != Movement::Stop.to_u8() {
+                set_movement(Movement::Stop);
+                right_speed_up = 30;
+                left_speed_up = 30;
+            }
+            Timer::after_millis(500).await;
+            continue;
+        }
 
-    set_movement(Movement::Forward);
-    Timer::after_millis(1000).await;
+        if (left_tof < 400 && left_tof > 20) && (right_tof < 400 && right_tof > 20) {
+            set_movement(Movement::Forward);
+            right_speed_up = (right_speed_up + 1).min(100);
+            left_speed_up = (left_speed_up + 1).min(100);
+            set_speed(right_speed_up);
+        } else {
+            if left_tof < 400 && left_tof > 20 {
+                set_movement(Movement::SpinRight);
+                set_speed(right_speed_up);
+                left_speed_up = (left_speed_up - 1).min(100);
+            } else if left_tof < 400 && left_tof > 20 {
+                set_movement(Movement::SpinLeft);
+                set_speed(left_speed_up);
+                right_speed_up = (right_speed_up - 1).min(100);
+            }
+        }
 
-    set_movement(Movement::SpinLeft);
-    Timer::after_millis(500).await;
+        if left_tof > 400 && right_tof > 400 && left_speed_up > 25 && right_speed_up > 25 {
+            right_speed_up = 30;
+            left_speed_up = 30;
+        }
 
-    set_movement(Movement::Forward);
-    Timer::after_millis(1000).await;
+        if right_speed_up >= 100 {
+            right_speed_up = 100;
+        }
 
-    set_movement(Movement::Backward);
-    Timer::after_millis(1000).await;
+        if left_speed_up >= 100 {
+            left_speed_up = 100;
+        }
 
-    set_movement(Movement::Stop);
-
-    RUN.store(false, core::sync::atomic::Ordering::Relaxed);
+        Timer::after_millis(500).await;
+    }
 }
 
 ///Helper function to set the speed of the robot easier
@@ -336,7 +364,6 @@ async fn floor_sensors_task(left: GpioPin<13>, right: GpioPin<34>, adc1: ADC1, a
     }
 }
 
-
 ///Sets up the motors and controls them based on the global variables
 #[embassy_executor::task]
 async fn motors_task(
@@ -421,7 +448,6 @@ async fn motors_task(
                 //Motor spins counter clockwise
                 left_motor_a.set_timestamp(speed);
                 left_motor_b.set_timestamp(0);
-
             }
             Movement::SpinLeft => {
                 //Motor spins  clockwise
@@ -501,7 +527,9 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
 
             let right_fl = RIGHT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
             let left_fl = LEFT_FLOOR.load(core::sync::atomic::Ordering::Relaxed);
-            write!(bottom_line_cursor, "L_FL: {} R_FL: {}", left_fl, right_fl).unwrap();
+            // write!(bottom_line_cursor, "L_FL: {} R_FL: {}", left_fl, right_fl).unwrap();
+            let running = RUN.load(core::sync::atomic::Ordering::Relaxed);
+            write!(bottom_line_cursor, "L_FL: {}  RUN: {}", left_fl, running).unwrap();
             let _ = Text::with_baseline(
                 bottom_line_cursor.as_str(),
                 Point::new(0, 10),
@@ -539,7 +567,7 @@ async fn oled_task(i2c_bus: &'static NoopMutex<RefCell<I2c<'static, Blocking>>>)
                 .draw(&mut display.color_converted())
                 .unwrap();
         }
-         // Write changes to the display
+        // Write changes to the display
         let _ = display.flush();
 
         Timer::after(Duration::from_millis(50)).await;
